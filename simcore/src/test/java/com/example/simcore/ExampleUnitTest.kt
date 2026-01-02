@@ -9,8 +9,10 @@ class ExampleUnitTest {
     fun determinism_goldenHash_600Steps() {
         val final = runSteps(GameState(), steps = 600, dtMicros = GameState.DEFAULT_DT_MICROS)
 
-        // Golden hash for this exact Milestone 0 harness implementation.
-        val expected = "258-9894f0-170fb63ffbb800d2"
+        // Updated golden hash (Milestone 3 extends worldHash to include fleets.size).
+        // Empty worldHash is stable:
+        // worldHash(empty planets, empty edges, empty fleets) = 81d23fd7003c2305
+        val expected = "258-9894f0-170fb63ffbb800d2-81d23fd7003c2305"
         assertEquals("Determinism golden hash mismatch at 600 steps", expected, final.stateHash())
     }
 
@@ -18,6 +20,50 @@ class ExampleUnitTest {
     fun determinism_sameInputs_sameOutputs() {
         val a = runSteps(GameState(), steps = 600, dtMicros = GameState.DEFAULT_DT_MICROS)
         val b = runSteps(GameState(), steps = 600, dtMicros = GameState.DEFAULT_DT_MICROS)
+        assertEquals(a.stateHash(), b.stateHash())
+    }
+
+    @Test
+    fun worldHash_independentOfInsertionOrder() {
+        // Same world, inserted in different orders. We canonicalize to sorted-by-id.
+        val p1 = Planet(
+            id = 1,
+            pos = Vec2(10.0, 0.0),
+            owner = Owner.P1,
+            unitsFloat = 5.5,
+            spawnRate = 3.0,
+            adjacencyEdgeIds = listOf(10)
+        )
+        val p2 = Planet(
+            id = 2,
+            pos = Vec2(0.0, 10.0),
+            owner = Owner.NEUTRAL,
+            unitsFloat = 2.0,
+            spawnRate = 0.0,
+            adjacencyEdgeIds = listOf(10)
+        )
+        val e10 = Edge(
+            id = 10,
+            aPlanetId = 1,
+            bPlanetId = 2,
+            lengthWorldUnits = 14.1421356237
+        )
+
+        val a = GameState(
+            planets = listOf(p1, p2),
+            edges = listOf(e10),
+            fleets = emptyList(),
+            nextFleetId = 0
+        )
+
+        val b = GameState(
+            planets = listOf(p2, p1).sortedBy { it.id }.map { it.canonical() },
+            edges = listOf(e10),
+            fleets = emptyList(),
+            nextFleetId = 0
+        )
+
+        assertEquals(a.worldHash(), b.worldHash())
         assertEquals(a.stateHash(), b.stateHash())
     }
 
