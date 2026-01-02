@@ -1,11 +1,13 @@
 package com.example.simcore
 
+import kotlin.math.ceil
+import kotlin.math.floor
+
 /**
- * Deterministic sim core (Milestone 0..4).
+ * Deterministic sim core (Milestone 0..5).
  *
- * Milestone 4 adds:
- * - Command queue processed at deterministic boundaries
- * - Volley Send command implementation
+ * Milestone 5 adds:
+ * - Fleet -> Planet combat on arrival (spec exact).
  */
 data class GameState(
     val tick: Long = 0L,
@@ -135,7 +137,7 @@ data class GameState(
      * 0) apply commands due at current simTimeMicros
      * 1) update checksum inputs (time/tick)
      * 2) production update
-     * 3) fleet movement update
+     * 3) fleet movement update (and Milestone 5: arrival combat)
      */
     fun step(dtMicros: Long = DEFAULT_DT_MICROS): GameState {
         require(dtMicros >= 0L) { "dtMicros must be >= 0" }
@@ -155,7 +157,7 @@ data class GameState(
         val dtSeconds = dtMicros.toDouble() / 1_000_000.0
 
         // Milestone 2: production + clamp
-        val nextPlanets = if (afterCommands.planets.isEmpty() || dtMicros == 0L) {
+        val producedPlanets = if (afterCommands.planets.isEmpty() || dtMicros == 0L) {
             afterCommands.planets
         } else {
             afterCommands.planets.map { p ->
@@ -165,15 +167,22 @@ data class GameState(
             }
         }
 
-        // Milestone 3: fleets + movement
+        // Milestone 3/5: fleets + movement + arrival combat
         val graph = if (afterCommands.fleets.isEmpty() || dtMicros == 0L) null else afterCommands.mapGraph()
 
-        val nextFleets = if (graph == null) {
-            afterCommands.fleets
+        val (resolvedPlanets, nextFleets) = if (graph == null) {
+            producedPlanets to afterCommands.fleets
         } else {
+            // Deterministic id->index lookup for the (produced) planet list (still canonical sorted by id).
+            val planetIndexById = HashMap<Int, Int>(producedPlanets.size)
+            for (i in producedPlanets.indices) planetIndexById[producedPlanets[i].id] = i
+
+            val planetsMutable = producedPlanets.toMutableList()
             val speed = FLEET_SPEED_WORLD_UNITS_PER_SEC
+
             val moved = ArrayList<Fleet>(afterCommands.fleets.size)
 
+            // Fleets are canonical sorted by id; resolve in that order for determinism.
             for (f in afterCommands.fleets) {
                 val e = graph.edge(f.edgeId)
 
@@ -184,9 +193,9 @@ data class GameState(
                 }
 
                 val len = e.lengthWorldUnits
-                // Edge length 0 => instant arrival.
                 if (len <= 0.0) {
-                    // Arrival: remove fleet (Milestone 5 will resolve arrival combat).
+                    // Instant arrival => resolve combat, fleet consumed.
+                    resolveFleetArrivesAtPlanet(f, planetsMutable, planetIndexById)
                     continue
                 }
 
@@ -194,23 +203,92 @@ data class GameState(
                 val newProgress = f.progress + deltaProgress
 
                 if (newProgress >= 1.0) {
-                    // Arrival: remove fleet.
+                    // Arrival => resolve combat, fleet consumed.
+                    resolveFleetArrivesAtPlanet(f, planetsMutable, planetIndexById)
                     continue
                 } else {
                     moved.add(f.copy(progress = newProgress))
                 }
             }
 
-            moved
+            planetsMutable.toList() to moved
         }
 
         return afterCommands.copy(
             tick = nextTick,
             simTimeMicros = nextTime,
             checksum = h,
-            planets = nextPlanets,
+            planets = resolvedPlanets,
             fleets = nextFleets
         )
+    }
+
+    /**
+     * Milestone 5: Fleet -> Planet combat, spec exact.
+     *
+     * Let:
+     *   A = attacking fleet units
+     *   O = attacker offense
+     *   H = defender planet HP (floor(unitsFloat))
+     *   D = defender defense
+     *   B = attacker colonization bonus
+     *
+     * Damage:
+     *   damage = floor(A * O / D)
+     *
+     * Resolution:
+     * - If damage < H: defender keeps planet; newHP = H - damage
+     * - If damage == H: defender keeps planet; newHP = 0
+     * - If damage > H: attacker captures:
+     *     required = ceil(H * D / O)
+     *     remainder = A - required
+     *     newHP = remainder + B
+     *   On capture: ownership flips; internal units set exactly to newHP
+     *
+     * Note: fleet is always consumed on arrival.
+     */
+    private fun resolveFleetArrivesAtPlanet(
+        fleet: Fleet,
+        planetsMutable: MutableList<Planet>,
+        planetIndexById: Map<Int, Int>
+    ) {
+        val targetIndex = planetIndexById[fleet.toPlanetId] ?: return
+        val target = planetsMutable[targetIndex]
+
+        val attackerProfile = ShipProfiles.forOwner(fleet.owner)
+        val defenderProfile = ShipProfiles.forOwner(target.owner)
+
+        val A = fleet.unitsInt
+        val O = attackerProfile.offense
+        val H = target.intHP()
+        val D = defenderProfile.defense
+        val B = attackerProfile.colonizationBonus
+
+        // damage = floor(A * O / D)
+        val damage = floor((A.toDouble() * O) / D).toInt()
+
+        val updatedTarget = if (damage < H) {
+            val newHP = H - damage
+            // Interactions are integer-based; set internal exactly to the integer result.
+            if (newHP == H) target else target.copy(unitsFloat = newHP.toDouble())
+        } else if (damage == H) {
+            // Defender keeps planet with 0 HP.
+            if (H == 0) target else target.copy(unitsFloat = 0.0)
+        } else {
+            // Capture
+            // required = ceil(H * D / O)
+            val required = ceil((H.toDouble() * D) / O).toInt()
+            val remainder = A - required
+            val newHP = remainder + B
+
+            // On capture: ownership flips; internal units set exactly to newHP.
+            target.copy(
+                owner = fleet.owner,
+                unitsFloat = newHP.toDouble()
+            )
+        }
+
+        planetsMutable[targetIndex] = updatedTarget
     }
 
     /**
