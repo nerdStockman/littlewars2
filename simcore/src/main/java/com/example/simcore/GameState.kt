@@ -1,13 +1,23 @@
 package com.example.simcore
 
+import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.floor
+import kotlin.math.max
+import kotlin.math.min
 
 /**
- * Deterministic sim core (Milestone 0..5).
+ * Deterministic sim core (Milestone 0..7).
  *
- * Milestone 5 adds:
+ * Milestone 5:
  * - Fleet -> Planet combat on arrival (spec exact).
+ *
+ * Milestone 6:
+ * - Fleet <-> Fleet combat math (spec exact) in FleetFleetCombat.kt
+ *
+ * Milestone 7:
+ * - Collision detection + event ordering
+ *   Fleets interact only on collision; resolve deterministically in time order within the step.
  */
 data class GameState(
     val tick: Long = 0L,
@@ -137,7 +147,8 @@ data class GameState(
      * 0) apply commands due at current simTimeMicros
      * 1) update checksum inputs (time/tick)
      * 2) production update
-     * 3) fleet movement update (and Milestone 5: arrival combat)
+     * 3) fleet movement update with Milestone 7 event ordering:
+     *    - resolve collisions + arrivals in deterministic time order within the tick
      */
     fun step(dtMicros: Long = DEFAULT_DT_MICROS): GameState {
         require(dtMicros >= 0L) { "dtMicros must be >= 0" }
@@ -167,7 +178,7 @@ data class GameState(
             }
         }
 
-        // Milestone 3/5: fleets + movement + arrival combat
+        // Milestone 3/5/7: fleets + movement + collision/arrival event ordering
         val graph = if (afterCommands.fleets.isEmpty() || dtMicros == 0L) null else afterCommands.mapGraph()
 
         val (resolvedPlanets, nextFleets) = if (graph == null) {
@@ -178,40 +189,20 @@ data class GameState(
             for (i in producedPlanets.indices) planetIndexById[producedPlanets[i].id] = i
 
             val planetsMutable = producedPlanets.toMutableList()
-            val speed = FLEET_SPEED_WORLD_UNITS_PER_SEC
 
-            val moved = ArrayList<Fleet>(afterCommands.fleets.size)
+            val stepStartTime = afterCommands.simTimeMicros
+            val stepEndTime = stepStartTime + dtMicros
 
-            // Fleets are canonical sorted by id; resolve in that order for determinism.
-            for (f in afterCommands.fleets) {
-                val e = graph.edge(f.edgeId)
+            val resultFleets = resolveFleetEventsWithinStep(
+                fleetsIn = afterCommands.fleets,
+                graph = graph,
+                planetsMutable = planetsMutable,
+                planetIndexById = planetIndexById,
+                stepStartTimeMicros = stepStartTime,
+                stepEndTimeMicros = stepEndTime
+            )
 
-                // If edge missing, keep fleet as-is (deterministic, non-crashing).
-                if (e == null) {
-                    moved.add(f)
-                    continue
-                }
-
-                val len = e.lengthWorldUnits
-                if (len <= 0.0) {
-                    // Instant arrival => resolve combat, fleet consumed.
-                    resolveFleetArrivesAtPlanet(f, planetsMutable, planetIndexById)
-                    continue
-                }
-
-                val deltaProgress = (speed * dtSeconds) / len
-                val newProgress = f.progress + deltaProgress
-
-                if (newProgress >= 1.0) {
-                    // Arrival => resolve combat, fleet consumed.
-                    resolveFleetArrivesAtPlanet(f, planetsMutable, planetIndexById)
-                    continue
-                } else {
-                    moved.add(f.copy(progress = newProgress))
-                }
-            }
-
-            planetsMutable.toList() to moved
+            planetsMutable.toList() to resultFleets
         }
 
         return afterCommands.copy(
@@ -221,6 +212,382 @@ data class GameState(
             planets = resolvedPlanets,
             fleets = nextFleets
         )
+    }
+
+    /**
+     * Milestone 7: Resolve all fleet movement, collisions, and arrivals within one simulation step,
+     * in deterministic time order.
+     *
+     * Deterministic tie-breaks:
+     * - Primary: eventTimeMicros ascending
+     * - Secondary: event type order (collision before arrival at same instant)
+     * - Tertiary: stable ID ordering
+     *   - collision: (minFleetId, maxFleetId)
+     *   - arrival: (fleetId, Int.MAX_VALUE)
+     */
+    private fun resolveFleetEventsWithinStep(
+        fleetsIn: List<Fleet>,
+        graph: MapGraph,
+        planetsMutable: MutableList<Planet>,
+        planetIndexById: Map<Int, Int>,
+        stepStartTimeMicros: Long,
+        stepEndTimeMicros: Long
+    ): List<Fleet> {
+        if (fleetsIn.isEmpty()) return emptyList()
+        val dtMicrosTotal = stepEndTimeMicros - stepStartTimeMicros
+        if (dtMicrosTotal <= 0L) return fleetsIn
+
+        // We'll mutate a working list of fleets (kept canonical sorted by id after each event).
+        var fleets = fleetsIn.map { it.canonical() }.sortedBy { it.id }
+
+        var curTime = stepStartTimeMicros
+
+        while (curTime < stepEndTimeMicros && fleets.isNotEmpty()) {
+            val remainingMicros = stepEndTimeMicros - curTime
+            val evt = findNextEvent(
+                fleets = fleets,
+                graph = graph,
+                curTimeMicros = curTime,
+                remainingMicros = remainingMicros
+            )
+
+            if (evt == null) {
+                // No events: advance everybody to end of step and finish.
+                fleets = advanceAllFleets(fleets, graph, remainingMicros)
+                break
+            }
+
+            val advanceMicros = evt.eventTimeMicros - curTime
+            if (advanceMicros > 0L) {
+                fleets = advanceAllFleets(fleets, graph, advanceMicros)
+                curTime += advanceMicros
+            } else {
+                // Event at current instant; no time advance.
+                curTime = evt.eventTimeMicros
+            }
+
+            // Resolve event at this instant.
+            fleets = when (evt) {
+                is FleetEvent.Collision -> resolveCollisionAtInstant(
+                    fleets = fleets,
+                    graph = graph,
+                    collision = evt
+                )
+                is FleetEvent.Arrival -> resolveArrivalAtInstant(
+                    fleets = fleets,
+                    planetsMutable = planetsMutable,
+                    planetIndexById = planetIndexById,
+                    arrival = evt
+                )
+            }.sortedBy { it.id }
+
+            // Safety: if event resolution didn't progress time and didn't change fleets, avoid infinite loop.
+            // This should not happen in normal cases, but determinism > crashing.
+            if (advanceMicros == 0L && evt.eventTimeMicros == curTime) {
+                // If the same event would repeat, nudge time forward by 1 micro to guarantee progress.
+                // (Still deterministic.)
+                if (curTime < stepEndTimeMicros) curTime += 1L
+            }
+        }
+
+        return fleets.map { it.canonical() }.sortedBy { it.id }
+    }
+
+    /**
+     * Advance all fleets forward for a given duration (micros), without resolving any collisions/arrivals.
+     * Any fleet that would reach progress >= 1 is clamped to 1.0 (arrival events should be resolved earlier).
+     */
+    private fun advanceAllFleets(
+        fleets: List<Fleet>,
+        graph: MapGraph,
+        advanceMicros: Long
+    ): List<Fleet> {
+        if (advanceMicros <= 0L) return fleets
+        val dtSeconds = advanceMicros.toDouble() / 1_000_000.0
+        val speed = FLEET_SPEED_WORLD_UNITS_PER_SEC
+
+        val out = ArrayList<Fleet>(fleets.size)
+        for (f in fleets) {
+            val e = graph.edge(f.edgeId)
+            if (e == null) {
+                out.add(f)
+                continue
+            }
+            val len = e.lengthWorldUnits
+            if (len <= 0.0) {
+                // Zero-length edges are "instant" — arrival should be handled as an arrival event.
+                // Here: clamp to 1.0 to avoid NaNs.
+                out.add(f.copy(progress = 1.0))
+                continue
+            }
+            val deltaProgress = (speed * dtSeconds) / len
+            val newProgress = f.progress + deltaProgress
+            out.add(f.copy(progress = if (newProgress >= 1.0) 1.0 else newProgress))
+        }
+        return out
+    }
+
+    /**
+     * Find the next event (collision or arrival) within the remaining time of this step.
+     * Returns null if no event occurs before step end.
+     */
+    private fun findNextEvent(
+        fleets: List<Fleet>,
+        graph: MapGraph,
+        curTimeMicros: Long,
+        remainingMicros: Long
+    ): FleetEvent? {
+        if (remainingMicros <= 0L) return null
+
+        var best: FleetEvent? = null
+
+        // 1) Arrival events
+        for (f in fleets) {
+            val e = graph.edge(f.edgeId) ?: continue
+            val len = e.lengthWorldUnits
+            val tMicros = if (len <= 0.0) {
+                0L
+            } else {
+                val speed = FLEET_SPEED_WORLD_UNITS_PER_SEC
+                val vProgPerSec = speed / len
+                if (vProgPerSec <= 0.0) continue
+
+                val remainingProg = 1.0 - f.progress
+                if (remainingProg <= ARRIVAL_EPS_PROGRESS) 0L
+                else {
+                    val tSec = remainingProg / vProgPerSec
+                    val t = floor(tSec * 1_000_000.0).toLong()
+                    max(0L, t)
+                }
+            }
+
+            if (tMicros <= remainingMicros) {
+                val evtTime = curTimeMicros + tMicros
+                val evt = FleetEvent.Arrival(
+                    eventTimeMicros = evtTime,
+                    fleetId = f.id
+                )
+                best = pickEarlier(best, evt)
+            }
+        }
+
+        // 2) Collision events (same edge, opposite directions)
+        // Group fleets by edgeId deterministically
+        val byEdge = fleets.groupBy { it.edgeId }
+        for ((edgeId, flist) in byEdge) {
+            if (flist.size < 2) continue
+            val edge = graph.edge(edgeId) ?: continue
+            val len = edge.lengthWorldUnits
+            if (len <= 0.0) continue // zero-length is handled as arrivals
+
+            val speed = FLEET_SPEED_WORLD_UNITS_PER_SEC
+            val dtSec = remainingMicros.toDouble() / 1_000_000.0
+            val deltaProgThisWindow = (speed * dtSec) / len
+
+            // Precompute scalar positions (0..1 along edge a->b) and scalar velocities for each fleet
+            data class K(
+                val fleet: Fleet,
+                val pos: Double,
+                val vel: Double // scalar units per "window" (not per second): pos += vel * tFrac, where tFrac in [0,1]
+            )
+
+            val ks = ArrayList<K>(flist.size)
+            for (f in flist) {
+                val (pos, vel) = scalarPosAndVel(edge, f, deltaProgThisWindow)
+                ks.add(K(f, pos, vel))
+            }
+
+            // Consider pairs: collision when two fleets are approaching and their scalar positions cross (or start within tolerance)
+            // We'll compute collision time fraction t in [0,1] of the remaining window.
+            for (i in 0 until ks.size) {
+                for (j in i + 1 until ks.size) {
+                    val a = ks[i]
+                    val b = ks[j]
+
+                    // Ensure a starts "left" of b in scalar position
+                    var left = a
+                    var right = b
+                    if (left.pos > right.pos) {
+                        left = b
+                        right = a
+                    }
+
+                    // Relative closing speed must be positive
+                    val rel = left.vel - right.vel
+                    if (rel <= 0.0) continue
+
+                    val sep0 = right.pos - left.pos
+                    val tFrac: Double = if (sep0 <= COLLISION_TOLERANCE_PROGRESS) {
+                        0.0
+                    } else {
+                        sep0 / rel
+                    }
+
+                    if (!tFrac.isFinite()) continue
+                    if (tFrac < 0.0 || tFrac > 1.0) continue
+
+                    // Convert to micros (floor) for deterministic ordering.
+                    val tMicros = floor(tFrac * remainingMicros.toDouble()).toLong()
+                    val evtTime = curTimeMicros + tMicros
+
+                    val id1 = min(left.fleet.id, right.fleet.id)
+                    val id2 = max(left.fleet.id, right.fleet.id)
+
+                    val evt = FleetEvent.Collision(
+                        eventTimeMicros = evtTime,
+                        fleetIdA = id1,
+                        fleetIdB = id2
+                    )
+
+                    best = pickEarlier(best, evt)
+                }
+            }
+        }
+
+        // If best occurs after the window, ignore.
+        return best?.takeIf { it.eventTimeMicros <= curTimeMicros + remainingMicros }
+    }
+
+    private data class EventKey(
+        val time: Long,
+        val typeOrder: Int,
+        val a: Int,
+        val b: Int
+    ) : Comparable<EventKey> {
+        override fun compareTo(other: EventKey): Int {
+            val t = time.compareTo(other.time)
+            if (t != 0) return t
+            val ty = typeOrder.compareTo(other.typeOrder)
+            if (ty != 0) return ty
+            val aa = a.compareTo(other.a)
+            if (aa != 0) return aa
+            return b.compareTo(other.b)
+        }
+    }
+
+    private fun pickEarlier(a: FleetEvent?, b: FleetEvent): FleetEvent {
+        if (a == null) return b
+        val ka = a.sortKey()
+        val kb = b.sortKey()
+        return if (ka <= kb) a else b
+    }
+
+    private fun FleetEvent.sortKey(): EventKey {
+        return when (this) {
+            is FleetEvent.Collision -> EventKey(eventTimeMicros, 0, fleetIdA, fleetIdB)
+            is FleetEvent.Arrival -> EventKey(eventTimeMicros, 1, fleetId, Int.MAX_VALUE)
+        }
+    }
+
+
+    /**
+     * Compute scalar position and scalar velocity along canonical edge direction (a->b).
+     *
+     * - scalarPos is in [0,1] where 0 at a, 1 at b.
+     * - scalarVel is per-window (not per second): scalarPos += scalarVel * tFrac, tFrac in [0,1] of the window.
+     *
+     * Fleet progress always increases along its own travel direction, but scalar position
+     * increases if fleet travels a->b, decreases if fleet travels b->a.
+     */
+    private fun scalarPosAndVel(edge: Edge, f: Fleet, deltaProgThisWindow: Double): Pair<Double, Double> {
+        val a = edge.aPlanetId
+        val b = edge.bPlanetId
+
+        val isAToB = (f.fromPlanetId == a && f.toPlanetId == b)
+        val isBToA = (f.fromPlanetId == b && f.toPlanetId == a)
+
+        // If fleet endpoints don't match edge endpoints (shouldn't happen, but stay deterministic):
+        // treat as a->b.
+        val dirAToB = if (isAToB) true else if (isBToA) false else true
+
+        val scalarPos = if (dirAToB) {
+            f.progress
+        } else {
+            1.0 - f.progress
+        }
+
+        val scalarVel = if (dirAToB) {
+            deltaProgThisWindow
+        } else {
+            -deltaProgThisWindow
+        }
+
+        return scalarPos to scalarVel
+    }
+
+    /**
+     * Resolve a collision event at the current instant.
+     * Fleets interact only on collision; use spec fleet-fleet combat.
+     */
+    private fun resolveCollisionAtInstant(
+        fleets: List<Fleet>,
+        graph: MapGraph,
+        collision: FleetEvent.Collision
+    ): List<Fleet> {
+        // Find the two fleets by id (fleets is sorted by id).
+        val idxA = fleets.binarySearchBy(collision.fleetIdA) { it.id }
+        val idxB = fleets.binarySearchBy(collision.fleetIdB) { it.id }
+        if (idxA < 0 || idxB < 0) return fleets
+
+        val fA = fleets[idxA]
+        val fB = fleets[idxB]
+
+        // They must be on same edge and opposite directions to be a valid collision.
+        if (fA.edgeId != fB.edgeId) return fleets
+        val e = graph.edge(fA.edgeId) ?: return fleets
+
+        val a = e.aPlanetId
+        val b = e.bPlanetId
+
+        val aAToB = (fA.fromPlanetId == a && fA.toPlanetId == b)
+        val aBToA = (fA.fromPlanetId == b && fA.toPlanetId == a)
+        val bAToB = (fB.fromPlanetId == a && fB.toPlanetId == b)
+        val bBToA = (fB.fromPlanetId == b && fB.toPlanetId == a)
+
+        val opposite = (aAToB && bBToA) || (aBToA && bAToB)
+        if (!opposite) return fleets
+
+        val profA = ShipProfiles.forOwner(fA.owner)
+        val profB = ShipProfiles.forOwner(fB.owner)
+
+        val (outA, outB) = FleetFleetCombat.resolveFleets(
+            f1 = fA,
+            airToAir1 = profA.airToAir,
+            f2 = fB,
+            airToAir2 = profB.airToAir
+        )
+
+        val out = ArrayList<Fleet>(fleets.size)
+        for (f in fleets) {
+            when (f.id) {
+                fA.id -> if (outA != null) out.add(outA)
+                fB.id -> if (outB != null) out.add(outB)
+                else -> out.add(f)
+            }
+        }
+        return out
+    }
+
+    /**
+     * Resolve an arrival event at the current instant: apply Fleet->Planet combat and consume the fleet.
+     */
+    private fun resolveArrivalAtInstant(
+        fleets: List<Fleet>,
+        planetsMutable: MutableList<Planet>,
+        planetIndexById: Map<Int, Int>,
+        arrival: FleetEvent.Arrival
+    ): List<Fleet> {
+        val idx = fleets.binarySearchBy(arrival.fleetId) { it.id }
+        if (idx < 0) return fleets
+
+        val f = fleets[idx]
+        resolveFleetArrivesAtPlanet(f, planetsMutable, planetIndexById)
+
+        val out = ArrayList<Fleet>(fleets.size - 1)
+        for (ff in fleets) {
+            if (ff.id != f.id) out.add(ff)
+        }
+        return out
     }
 
     /**
@@ -458,11 +825,30 @@ data class GameState(
         return h
     }
 
+    // --- Milestone 7 event model ---
+
+    private sealed class FleetEvent(open val eventTimeMicros: Long) {
+        data class Collision(
+            override val eventTimeMicros: Long,
+            val fleetIdA: Int,
+            val fleetIdB: Int
+        ) : FleetEvent(eventTimeMicros)
+
+        data class Arrival(
+            override val eventTimeMicros: Long,
+            val fleetId: Int
+        ) : FleetEvent(eventTimeMicros)
+    }
+
     companion object {
         const val DEFAULT_DT_MICROS: Long = 16_666L // ~60 Hz
 
         // Milestone 3: base fleet speed (world-units / second).
         const val FLEET_SPEED_WORLD_UNITS_PER_SEC: Double = 10.0
+
+        // Milestone 7: tolerances
+        private const val COLLISION_TOLERANCE_PROGRESS: Double = 1e-9
+        private const val ARRIVAL_EPS_PROGRESS: Double = 1e-12
 
         private const val FNV_OFFSET_BASIS: ULong = 0xcbf29ce484222325uL
         private const val FNV_PRIME: ULong = 0x100000001b3uL
