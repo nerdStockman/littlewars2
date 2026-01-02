@@ -1,13 +1,11 @@
 package com.example.simcore
 
 /**
- * Deterministic sim core (Milestone 0 + Milestone 1 world model + Milestone 2 production + Milestone 3 fleets).
+ * Deterministic sim core (Milestone 0..4).
  *
- * Milestone 3 adds:
- * - fleets list stored canonically sorted by id
- * - monotonic nextFleetId counter
- * - deterministic fleet movement on edges each step
- * - fleets removed on arrival (progress >= 1)
+ * Milestone 4 adds:
+ * - Command queue processed at deterministic boundaries
+ * - Volley Send command implementation
  */
 data class GameState(
     val tick: Long = 0L,
@@ -20,7 +18,11 @@ data class GameState(
 
     // Milestone 3
     val fleets: List<Fleet> = emptyList(),
-    val nextFleetId: Int = 0
+    val nextFleetId: Int = 0,
+
+    // Milestone 4
+    val pendingCommands: List<Command> = emptyList(),
+    val nextCommandId: Int = 0
 ) {
 
     init {
@@ -28,9 +30,11 @@ data class GameState(
         // - planets stored sorted by id; adjacencyEdgeIds sorted
         // - edges stored sorted by id
         // - fleets stored sorted by id
+        // - pendingCommands stored sorted by (simTimeMicros, id)
         val canonPlanets = planets.map { it.canonical() }.sortedBy { it.id }
         val canonEdges = edges.sortedBy { it.id }
         val canonFleets = fleets.map { it.canonical() }.sortedBy { it.id }
+        val canonCommands = pendingCommands.sortedWith(compareBy<Command>({ it.simTimeMicros }, { it.id }))
 
         require(planets == canonPlanets) {
             "GameState.planets must be canonical (sorted by id; adjacencyEdgeIds sorted)."
@@ -41,6 +45,9 @@ data class GameState(
         require(fleets == canonFleets) {
             "GameState.fleets must be canonical (sorted by id; progress clamped)."
         }
+        require(pendingCommands == canonCommands) {
+            "GameState.pendingCommands must be canonical (sorted by simTimeMicros then id)."
+        }
 
         require(nextFleetId >= 0) { "nextFleetId must be >= 0" }
         if (fleets.isNotEmpty()) {
@@ -49,12 +56,18 @@ data class GameState(
                 "nextFleetId must be > max existing fleet id (max=$maxId, nextFleetId=$nextFleetId)"
             }
         }
+
+        require(nextCommandId >= 0) { "nextCommandId must be >= 0" }
+        if (pendingCommands.isNotEmpty()) {
+            val maxId = pendingCommands.maxOf { it.id }
+            require(nextCommandId > maxId) {
+                "nextCommandId must be > max existing command id (max=$maxId, nextCommandId=$nextCommandId)"
+            }
+        }
     }
 
     /**
      * Deterministic helper to spawn a fleet with a monotonic ID.
-     *
-     * (Commands come in Milestone 4; for now this is used by tests / future plumbing.)
      */
     fun spawnFleet(
         owner: Int,
@@ -84,22 +97,57 @@ data class GameState(
     }
 
     /**
+     * Milestone 4 helper: enqueue a Volley Send command deterministically.
+     *
+     * Note: UI will eventually create commands directly; this is for tests / plumbing.
+     */
+    fun enqueueVolleySend(
+        simTimeMicros: Long,
+        playerId: Int,
+        sourcePlanetId: Int,
+        targetPlanetId: Int,
+        fraction: SendFraction
+    ): GameState {
+        val cmd = Command(
+            id = nextCommandId,
+            simTimeMicros = simTimeMicros,
+            playerId = playerId,
+            kind = Command.Kind.VOLLEY_SEND,
+            sourcePlanetId = sourcePlanetId,
+            targetPlanetId = targetPlanetId,
+            fraction = fraction
+        )
+        val next = (pendingCommands + cmd).sortedWith(compareBy<Command>({ it.simTimeMicros }, { it.id }))
+        return copy(
+            pendingCommands = next,
+            nextCommandId = nextCommandId + 1
+        )
+    }
+
+    /**
      * Deterministic fixed timestep step.
-     * dtMicros default ~= 60 Hz (16.666 ms).
+     *
+     * Milestone 4 command timing rule:
+     * - Apply any pending command with simTimeMicros <= *current* simTimeMicros
+     *   at the START of the step.
      *
      * Ordering:
-     * 1) update checksum inputs
+     * 0) apply commands due at current simTimeMicros
+     * 1) update checksum inputs (time/tick)
      * 2) production update
      * 3) fleet movement update
      */
     fun step(dtMicros: Long = DEFAULT_DT_MICROS): GameState {
         require(dtMicros >= 0L) { "dtMicros must be >= 0" }
 
-        val nextTick = tick + 1L
-        val nextTime = simTimeMicros + dtMicros
+        // 0) Apply due commands at the start of the step.
+        val afterCommands = applyDueCommands()
+
+        val nextTick = afterCommands.tick + 1L
+        val nextTime = afterCommands.simTimeMicros + dtMicros
 
         // Update checksum deterministically based on meaningful state evolution.
-        var h = checksum
+        var h = afterCommands.checksum
         h = fnv1aUpdateLong(h, nextTick)
         h = fnv1aUpdateLong(h, nextTime)
         h = fnv1aUpdateLong(h, dtMicros)
@@ -107,10 +155,10 @@ data class GameState(
         val dtSeconds = dtMicros.toDouble() / 1_000_000.0
 
         // Milestone 2: production + clamp
-        val nextPlanets = if (planets.isEmpty() || dtMicros == 0L) {
-            planets
+        val nextPlanets = if (afterCommands.planets.isEmpty() || dtMicros == 0L) {
+            afterCommands.planets
         } else {
-            planets.map { p ->
+            afterCommands.planets.map { p ->
                 val updated = p.unitsFloat + (p.spawnRate * dtSeconds)
                 val clamped = if (updated < 0.0) 0.0 else updated
                 if (clamped == p.unitsFloat) p else p.copy(unitsFloat = clamped)
@@ -118,15 +166,15 @@ data class GameState(
         }
 
         // Milestone 3: fleets + movement
-        val graph = if (fleets.isEmpty() || dtMicros == 0L) null else mapGraph()
+        val graph = if (afterCommands.fleets.isEmpty() || dtMicros == 0L) null else afterCommands.mapGraph()
 
         val nextFleets = if (graph == null) {
-            fleets
+            afterCommands.fleets
         } else {
             val speed = FLEET_SPEED_WORLD_UNITS_PER_SEC
-            val moved = ArrayList<Fleet>(fleets.size)
+            val moved = ArrayList<Fleet>(afterCommands.fleets.size)
 
-            for (f in fleets) {
+            for (f in afterCommands.fleets) {
                 val e = graph.edge(f.edgeId)
 
                 // If edge missing, keep fleet as-is (deterministic, non-crashing).
@@ -153,16 +201,96 @@ data class GameState(
                 }
             }
 
-            // Canonical order preserved (fleet ids are unique, list was canonical, we iterate in order).
             moved
         }
 
-        return copy(
+        return afterCommands.copy(
             tick = nextTick,
             simTimeMicros = nextTime,
             checksum = h,
             planets = nextPlanets,
             fleets = nextFleets
+        )
+    }
+
+    /**
+     * Applies all commands with simTimeMicros <= current simTimeMicros, in canonical order.
+     * Invalid commands are dropped deterministically (no state change).
+     */
+    private fun applyDueCommands(): GameState {
+        if (pendingCommands.isEmpty()) return this
+
+        // pendingCommands is canonical sorted by (simTimeMicros, id).
+        val cutoff = simTimeMicros
+        var splitIndex = 0
+        while (splitIndex < pendingCommands.size && pendingCommands[splitIndex].simTimeMicros <= cutoff) {
+            splitIndex++
+        }
+        if (splitIndex == 0) return this
+
+        val toApply = pendingCommands.subList(0, splitIndex)
+        val remaining = pendingCommands.subList(splitIndex, pendingCommands.size)
+
+        if (toApply.isEmpty()) {
+            return copy(pendingCommands = remaining.toList())
+        }
+
+        val graph = mapGraph()
+
+        // Planets are canonical sorted by id; build deterministic id->index lookup.
+        val planetIndexById = HashMap<Int, Int>(planets.size)
+        for (i in planets.indices) planetIndexById[planets[i].id] = i
+
+        var cur = this.copy(pendingCommands = remaining.toList())
+        for (cmd in toApply) {
+            cur = cur.applyCommand(cmd, graph, planetIndexById)
+        }
+        return cur
+    }
+
+    private fun applyCommand(cmd: Command, graph: MapGraph, planetIndexById: Map<Int, Int>): GameState {
+        return when (cmd.kind) {
+            Command.Kind.VOLLEY_SEND -> applyVolleySend(cmd, graph, planetIndexById)
+        }
+    }
+
+    /**
+     * Volley Send implementation (Milestone 4).
+     */
+    private fun applyVolleySend(cmd: Command, graph: MapGraph, planetIndexById: Map<Int, Int>): GameState {
+        // Basic ownership check: command player must own the source planet.
+        val srcIndex = planetIndexById[cmd.sourcePlanetId] ?: return this
+        val src = planets[srcIndex]
+        if (src.owner != cmd.playerId) return this
+
+        // Source/target must be adjacent; pick the smallest edgeId if multiple edges exist.
+        val edgeId = graph.neighborPairs(cmd.sourcePlanetId)
+            .filter { (neighborId, _) -> neighborId == cmd.targetPlanetId }
+            .minOfOrNull { it.second }
+            ?: return this
+
+        // Available is floored int HP.
+        val available = src.intHP()
+        val sendUnits = cmd.fraction.computeSendUnits(available)
+        if (sendUnits < 1) return this
+
+        // Subtract immediately from unitsFloat (keeping fractional remainder).
+        val newUnitsFloat = (src.unitsFloat - sendUnits.toDouble()).coerceAtLeast(0.0)
+        val updatedSrc = if (newUnitsFloat == src.unitsFloat) src else src.copy(unitsFloat = newUnitsFloat)
+
+        // Update planets list deterministically by index (list stays canonical sorted by id).
+        val nextPlanets = planets.toMutableList()
+        nextPlanets[srcIndex] = updatedSrc
+
+        // Spawn the fleet.
+        val afterSubtract = copy(planets = nextPlanets)
+        return afterSubtract.spawnFleet(
+            owner = cmd.playerId,
+            unitsInt = sendUnits,
+            edgeId = edgeId,
+            fromPlanetId = cmd.sourcePlanetId,
+            toPlanetId = cmd.targetPlanetId,
+            progress = 0.0
         )
     }
 
@@ -182,9 +310,7 @@ data class GameState(
 
     /**
      * Deterministic hash of the world+dynamic state we care about for replay-style checks:
-     * planets + edges + fleets.
-     *
-     * (This intentionally includes fleets so replays detect movement differences.)
+     * planets + edges + fleets + pendingCommands.
      */
     fun worldHash(): ULong {
         var h = FNV_OFFSET_BASIS
@@ -192,6 +318,7 @@ data class GameState(
         h = fnv1aUpdateLong(h, planets.size.toLong())
         h = fnv1aUpdateLong(h, edges.size.toLong())
         h = fnv1aUpdateLong(h, fleets.size.toLong())
+        h = fnv1aUpdateLong(h, pendingCommands.size.toLong())
 
         // Planets (canonical sorted by id)
         for (p in planets) {
@@ -226,6 +353,17 @@ data class GameState(
             h = fnv1aUpdateLong(h, f.progress.toBits())
         }
 
+        // Commands (canonical sorted by simTimeMicros then id)
+        for (c in pendingCommands) {
+            h = fnv1aUpdateLong(h, c.id.toLong())
+            h = fnv1aUpdateLong(h, c.simTimeMicros)
+            h = fnv1aUpdateLong(h, c.playerId.toLong())
+            h = fnv1aUpdateLong(h, c.kind.ordinal.toLong())
+            h = fnv1aUpdateLong(h, c.sourcePlanetId.toLong())
+            h = fnv1aUpdateLong(h, c.targetPlanetId.toLong())
+            h = fnv1aUpdateLong(h, c.fraction.ordinal.toLong())
+        }
+
         return h
     }
 
@@ -246,7 +384,6 @@ data class GameState(
         const val DEFAULT_DT_MICROS: Long = 16_666L // ~60 Hz
 
         // Milestone 3: base fleet speed (world-units / second).
-        // Speed multipliers per ship type come later; this is the shared baseline.
         const val FLEET_SPEED_WORLD_UNITS_PER_SEC: Double = 10.0
 
         private const val FNV_OFFSET_BASIS: ULong = 0xcbf29ce484222325uL

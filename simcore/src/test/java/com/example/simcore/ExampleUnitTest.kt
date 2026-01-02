@@ -9,10 +9,9 @@ class ExampleUnitTest {
     fun determinism_goldenHash_600Steps() {
         val final = runSteps(GameState(), steps = 600, dtMicros = GameState.DEFAULT_DT_MICROS)
 
-        // Updated golden hash (Milestone 3 extends worldHash to include fleets.size).
-        // Empty worldHash is stable:
-        // worldHash(empty planets, empty edges, empty fleets) = 81d23fd7003c2305
-        val expected = "258-9894f0-170fb63ffbb800d2-81d23fd7003c2305"
+        // Updated golden hash for Milestone 4:
+        // worldHash now includes pendingCommands.size (0), so empty-world hash changes.
+        val expected = "258-9894f0-170fb63ffbb800d2-0c8210784d8af5a5"
         assertEquals("Determinism golden hash mismatch at 600 steps", expected, final.stateHash())
     }
 
@@ -53,14 +52,18 @@ class ExampleUnitTest {
             planets = listOf(p1, p2),
             edges = listOf(e10),
             fleets = emptyList(),
-            nextFleetId = 0
+            nextFleetId = 0,
+            pendingCommands = emptyList(),
+            nextCommandId = 0
         )
 
         val b = GameState(
             planets = listOf(p2, p1).sortedBy { it.id }.map { it.canonical() },
             edges = listOf(e10),
             fleets = emptyList(),
-            nextFleetId = 0
+            nextFleetId = 0,
+            pendingCommands = emptyList(),
+            nextCommandId = 0
         )
 
         assertEquals(a.worldHash(), b.worldHash())
