@@ -6,8 +6,8 @@ import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
 import android.util.AttributeSet
+import android.view.MotionEvent
 import android.view.View
-import com.example.simcore.Edge
 import com.example.simcore.Fleet
 import com.example.simcore.GameState
 import com.example.simcore.Owner
@@ -15,19 +15,17 @@ import com.example.simcore.Planet
 import com.example.simcore.Vec2
 import kotlin.math.atan2
 import kotlin.math.cos
+import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
-import kotlin.math.sqrt
 
 /**
- * Milestone 8: Minimal viewer.
+ * Milestone 9: Viewer + tap input plumbing.
  *
- * - Draw edges as lines
- * - Draw planets as circles (owner color) + int HP label (floor(unitsFloat))
- * - Draw fleets as triangles pointing along travel direction + unit label
- *
- * No input. MainActivity pushes GameState into this view each tick.
+ * - Draw edges, planets, fleets
+ * - Hit-test taps on planets and call a listener with planetId
+ * - Optional selected planet highlight (source selection)
  */
 class GameView @JvmOverloads constructor(
     context: Context,
@@ -35,6 +33,16 @@ class GameView @JvmOverloads constructor(
 ) : View(context, attrs) {
 
     private var state: GameState? = null
+
+    private var onPlanetTapped: ((planetId: Int) -> Unit)? = null
+
+    // Selection highlight
+    private var selectedPlanetId: Int? = null
+
+    // Cached transform info from last draw (for deterministic hit testing in screen-space)
+    private var lastBounds: RectF? = null
+    private var lastScale: Float = 1f
+    private var lastPad: Float = 0f
 
     // Paints
     private val paintEdge = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -61,12 +69,65 @@ class GameView @JvmOverloads constructor(
         textSize = dp(14f)
     }
 
+    private val paintSelectRing = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = dp(4f)
+        color = 0xFFFFFFFF.toInt()
+    }
+
     private val planetRadius = dp(18f)
     private val fleetSize = dp(14f)
 
     fun setState(newState: GameState) {
         state = newState
         invalidate()
+    }
+
+    fun setOnPlanetTappedListener(listener: ((planetId: Int) -> Unit)?) {
+        onPlanetTapped = listener
+    }
+
+    fun setSelectedPlanetId(planetId: Int?) {
+        selectedPlanetId = planetId
+        invalidate()
+    }
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (event.action != MotionEvent.ACTION_UP) return true
+
+        val s = state ?: return true
+        if (s.planets.isEmpty()) return true
+
+        val bounds = lastBounds ?: return true
+
+        fun toScreen(v: Vec2): Pair<Float, Float> {
+            val x = (v.x - bounds.left) * lastScale + lastPad
+            val y = (v.y - bounds.top) * lastScale + lastPad
+            return x.toFloat() to y.toFloat()
+        }
+
+        val tx = event.x
+        val ty = event.y
+
+        // Hit test in screen-space (deterministic, no world inversion needed)
+        var bestId: Int? = null
+        var bestDist = Double.POSITIVE_INFINITY
+        val hitR = planetRadius * 1.15f
+
+        for (p in s.planets) {
+            val (sx, sy) = toScreen(p.pos)
+            val d = hypot((sx - tx).toDouble(), (sy - ty).toDouble())
+            if (d <= hitR && d < bestDist) {
+                bestDist = d
+                bestId = p.id
+            }
+        }
+
+        if (bestId != null) {
+            onPlanetTapped?.invoke(bestId!!)
+        }
+
+        return true
     }
 
     override fun onDraw(canvas: Canvas) {
@@ -79,7 +140,6 @@ class GameView @JvmOverloads constructor(
 
         // Background
         canvas.drawColor(0xFF101018.toInt())
-
         if (planets.isEmpty()) return
 
         // World->screen transform based on planet bounds
@@ -92,6 +152,11 @@ class GameView @JvmOverloads constructor(
         val worldW = max(1e-6, (bounds.right - bounds.left).toDouble())
         val worldH = max(1e-6, (bounds.bottom - bounds.top).toDouble())
         val scale = min(availableW / worldW.toFloat(), availableH / worldH.toFloat())
+
+        // Cache transform for hit testing
+        lastBounds = bounds
+        lastScale = scale
+        lastPad = pad
 
         fun toScreen(v: Vec2): Pair<Float, Float> {
             val x = (v.x - bounds.left) * scale + pad
@@ -130,9 +195,13 @@ class GameView @JvmOverloads constructor(
             canvas.drawCircle(x, y, planetRadius, paintPlanetFill)
             canvas.drawCircle(x, y, planetRadius, paintPlanetStroke)
 
+            // Selected ring (source)
+            if (selectedPlanetId != null && p.id == selectedPlanetId) {
+                canvas.drawCircle(x, y, planetRadius + dp(4f), paintSelectRing)
+            }
+
             // HP label
             val hp = p.intHP().toString()
-            // center text vertically
             val baseline = y - (paintText.descent() + paintText.ascent()) / 2f
             canvas.drawText(hp, x, baseline, paintText)
         }
@@ -150,11 +219,10 @@ class GameView @JvmOverloads constructor(
 
         val (sx, sy) = toScreen(Vec2(fx, fy))
 
-        val angle = atan2((to.y - from.y), (to.x - from.x)) // radians
+        val angle = atan2((to.y - from.y), (to.x - from.x))
         val dirX = cos(angle)
         val dirY = sin(angle)
 
-        // Triangle points: tip forward, two base points behind
         val tip = Pair(
             (sx + (dirX * fleetSize)).toFloat(),
             (sy + (dirY * fleetSize)).toFloat()
@@ -199,13 +267,12 @@ class GameView @JvmOverloads constructor(
     }
 
     private fun colorsForOwner(owner: Int): Triple<Int, Int, Int> {
-        // Fill, Stroke, Text
         return when (owner) {
             Owner.P1 -> Triple(0xFF7C4DFF.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt())
             Owner.P2 -> Triple(0xFF00BFA5.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt())
             Owner.P3 -> Triple(0xFFFFB300.toInt(), 0xFFFFFFFF.toInt(), 0xFF101018.toInt())
             Owner.P4 -> Triple(0xFFFF5252.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt())
-            else     -> Triple(0xFF5C6BC0.toInt(), 0xFFCFD8DC.toInt(), 0xFFFFFFFF.toInt()) // neutral
+            else     -> Triple(0xFF5C6BC0.toInt(), 0xFFCFD8DC.toInt(), 0xFFFFFFFF.toInt())
         }
     }
 
@@ -222,7 +289,6 @@ class GameView @JvmOverloads constructor(
             maxY = max(maxY, p.pos.y)
         }
 
-        // If all planets are same point, expand a bit
         val dx = maxX - minX
         val dy = maxY - minY
         if (dx < 1e-6 && dy < 1e-6) {
@@ -236,6 +302,5 @@ class GameView @JvmOverloads constructor(
     }
 
     private fun lerp(a: Double, b: Double, t: Double): Double = a + (b - a) * t
-
     private fun dp(v: Float): Float = v * resources.displayMetrics.density
 }
